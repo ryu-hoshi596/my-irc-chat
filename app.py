@@ -1,9 +1,10 @@
 
 import os
+import re
 import shutil
 import tempfile
 import threading
-from urllib.parse import urlparse
+import subprocess
 
 from flask import Flask, request, send_file, render_template_string
 from yt_dlp import YoutubeDL
@@ -11,63 +12,108 @@ from yt_dlp import YoutubeDL
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 4096
 
-# One active download at a time to reduce resource usage.
-download_lock = threading.Lock()
+lock = threading.Lock()
 MAX_SIZE = 100 * 1024 * 1024
 
 PAGE = """
 <!doctype html>
+<html>
+<head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Mini Media</title>
-<h2>Mini Media Downloader</h2>
-<form method="post">
-  <input name="url" type="url" required maxlength="2048"
-         placeholder="Paste video URL" style="width:95%">
-  <p>
-  <select name="format">
-    <option value="mp3">MP3 Audio</option>
-    <option value="mp4">MP4 Video</option>
-    <option value="3gp">3GP Video</option>
-  </select>
-  </p>
-  <button type="submit">Download</button>
+<title>MiniTube</title>
+</head>
+<body>
+<h2>MiniTube</h2>
+
+<form method="get">
+<input name="q" maxlength="150" required
+ value="{{ q }}" placeholder="Search YouTube"
+ style="width:95%">
+<button>Search</button>
 </form>
+
 <p>{{ message }}</p>
+
+{% for v in results %}
+<hr>
+<b>{{ v.title }}</b><br>
+{% if v.duration %}Duration: {{ v.duration }} sec<br>{% endif %}
+<form method="post">
+<input type="hidden" name="id" value="{{ v.id }}">
+<select name="format">
+<option value="mp3">MP3</option>
+<option value="mp4">MP4 (480p max)</option>
+<option value="3gp">3GP</option>
+</select>
+<button>Download</button>
+</form>
+{% endfor %}
+</body>
+</html>
 """
+
+
+def page(q="", results=None, message=""):
+    return render_template_string(
+        PAGE, q=q, results=results or [], message=message
+    )
+
 
 @app.route("/", methods=["GET", "POST"])
 def home():
     if request.method == "GET":
-        return render_template_string(PAGE, message="")
+        q = request.args.get("q", "").strip()[:150]
+        if not q:
+            return page()
 
-    url = request.form.get("url", "").strip()
+        try:
+            opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "extract_flat": True,
+                "playlistend": 5,
+                "socket_timeout": 10,
+            }
+            with YoutubeDL(opts) as ydl:
+                data = ydl.extract_info(
+                    "ytsearch5:" + q, download=False
+                )
+
+            results = []
+            for v in data.get("entries", []):
+                if not v:
+                    continue
+                vid = v.get("id", "")
+                if not re.fullmatch(r"[A-Za-z0-9_-]{11}", vid):
+                    continue
+                results.append({
+                    "id": vid,
+                    "title": v.get("title", "Untitled"),
+                    "duration": v.get("duration"),
+                })
+
+            return page(q, results, "No results found."
+                        if not results else "")
+        except Exception:
+            return page(q, message="Search failed. Try again.")
+
+    vid = request.form.get("id", "")
     fmt = request.form.get("format", "")
 
-    parsed = urlparse(url)
-    if (parsed.scheme not in ("http", "https")
-            or not parsed.hostname
-            or fmt not in ("mp3", "mp4", "3gp")):
-        return render_template_string(
-            PAGE, message="Invalid URL or format."
-        ), 400
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", vid):
+        return page(message="Invalid video ID."), 400
 
-    # Avoid obvious local/private hostnames. For a public deployment,
-    # add proper DNS/IP validation and redirect protections too.
-    host = parsed.hostname.lower()
-    if host in ("localhost",) or host.endswith(".local"):
-        return render_template_string(
-            PAGE, message="Local addresses are not allowed."
-        ), 400
+    if fmt not in ("mp3", "mp4", "3gp"):
+        return page(message="Invalid format."), 400
 
-    if not download_lock.acquire(blocking=False):
-        return render_template_string(
-            PAGE, message="Another download is running. Try later."
-        ), 429
+    if not lock.acquire(blocking=False):
+        return page(message="Another download is running."), 429
 
-    folder = tempfile.mkdtemp(prefix="media_")
+    folder = tempfile.mkdtemp(prefix="mini_")
+    url = "https://www.youtube.com/watch?v=" + vid
 
     opts = {
-        "outtmpl": os.path.join(folder, "%(title).80B.%(ext)s"),
+        "outtmpl": os.path.join(folder, "media.%(ext)s"),
         "noplaylist": True,
         "max_filesize": MAX_SIZE,
         "socket_timeout": 15,
@@ -84,7 +130,7 @@ def home():
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "mp3",
-                "preferredquality": "128",
+                "preferredquality": "96",
             }],
         })
     elif fmt == "mp4":
@@ -93,13 +139,13 @@ def home():
                 "best[ext=mp4][height<=480]/"
                 "best[height<=480][ext=mp4]/"
                 "best[height<=480]/best",
-            "merge_output_format": "mp4",
         })
     else:
-        # Only works if the source provides a compatible 3GP format.
-        opts.update({
-            "format": "best[ext=3gp]/3gp",
-        })
+        # Download a small source, then convert to 3GP.
+        opts["format"] = (
+            "best[height<=144][ext=mp4]/"
+            "best[height<=144]/best"
+        )
 
     try:
         with YoutubeDL(opts) as ydl:
@@ -110,14 +156,34 @@ def home():
             for f in os.listdir(folder)
             if os.path.isfile(os.path.join(folder, f))
         ]
-
         if not files:
             raise RuntimeError("No output file")
 
-        path = max(files, key=os.path.getsize)
+        path = files[0]
+
+        if fmt == "3gp":
+            converted = os.path.join(folder, "media.3gp")
+            subprocess.run(
+                [
+                    "ffmpeg", "-nostdin", "-y",
+                    "-i", path,
+                    "-vf", "scale=320:240:force_original_aspect_ratio=decrease",
+                    "-c:v", "mpeg4", "-q:v", "8",
+                    "-c:a", "aac", "-b:a", "32k",
+                    "-threads", "1",
+                    "-fs", str(MAX_SIZE),
+                    converted,
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=90,
+            )
+            os.remove(path)
+            path = converted
 
         if os.path.getsize(path) > MAX_SIZE:
-            raise RuntimeError("Output exceeds size limit")
+            raise RuntimeError("File too large")
 
         response = send_file(
             path,
@@ -127,20 +193,16 @@ def home():
 
         def cleanup():
             shutil.rmtree(folder, ignore_errors=True)
-            download_lock.release()
+            lock.release()
 
         response.call_on_close(cleanup)
         return response
 
     except Exception:
         shutil.rmtree(folder, ignore_errors=True)
-        download_lock.release()
-        return render_template_string(
-            PAGE,
-            message=(
-                "Download failed. The format may be unavailable, "
-                "FFmpeg may be missing, or the URL may be unsupported."
-            ),
+        lock.release()
+        return page(
+            message="Download failed. Check FFmpeg and format availability."
         ), 400
 
 
@@ -148,5 +210,5 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 5000))
-    )
-    
+  )
+          
